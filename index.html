@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gcode-Analyzer</title>
+<style>
+  :root {
+    --bg: #10141c; --card: #1a2029; --accent: #4dd0e1; --text: #e6ebf2;
+    --muted: #8794a5; --border: #2a3342;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg);
+    color: var(--text); min-height: 100vh; padding: 2rem 1rem;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin-bottom: .3rem; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); margin-bottom: 1.5rem; font-size: .95rem; }
+  #drop {
+    border: 2px dashed var(--border); border-radius: 14px; padding: 2.5rem 1rem;
+    text-align: center; color: var(--muted); cursor: pointer; transition: border-color .2s, background .2s;
+  }
+  #drop.over { border-color: var(--accent); background: rgba(77, 208, 225, .06); }
+  #drop strong { color: var(--text); }
+  #fileInput { display: none; }
+  .layout { display: grid; grid-template-columns: 300px 1fr; gap: 1rem; margin-top: 1.2rem; }
+  @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.1rem; }
+  .card h2 { font-size: .95rem; color: var(--accent); margin-bottom: .8rem; }
+  .stat { display: flex; justify-content: space-between; padding: .35rem 0; border-bottom: 1px solid var(--border); font-size: .88rem; }
+  .stat:last-child { border-bottom: none; }
+  .stat .k { color: var(--muted); }
+  .stat .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; background: #0b0e14; border-radius: 8px; display: block; }
+  .hidden { display: none; }
+  footer { margin-top: 1.5rem; color: var(--muted); font-size: .8rem; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Gcode-<span>Analyzer</span></h1>
+  <p class="sub">Gcode-Datei laden – Abmessungen, Layer, Filament und Druckzeit-Schätzung, direkt im Browser.</p>
+
+  <div id="drop">
+    <strong>.gcode-Datei hierher ziehen</strong><br>oder klicken zum Auswählen
+    <input type="file" id="fileInput" accept=".gcode,.gco,.g,.txt">
+  </div>
+
+  <div class="layout hidden" id="results">
+    <div class="card">
+      <h2>Analyse</h2>
+      <div class="stat"><span class="k">Datei</span><span class="v" id="sFile">–</span></div>
+      <div class="stat"><span class="k">Zeilen</span><span class="v" id="sLines">–</span></div>
+      <div class="stat"><span class="k">Breite (X)</span><span class="v" id="sX">–</span></div>
+      <div class="stat"><span class="k">Tiefe (Y)</span><span class="v" id="sY">–</span></div>
+      <div class="stat"><span class="k">Höhe (Z)</span><span class="v" id="sZ">–</span></div>
+      <div class="stat"><span class="k">Layer</span><span class="v" id="sLayers">–</span></div>
+      <div class="stat"><span class="k">Filament</span><span class="v" id="sFil">–</span></div>
+      <div class="stat"><span class="k">Bewegungsweg</span><span class="v" id="sDist">–</span></div>
+      <div class="stat"><span class="k">Druckzeit (ca.)</span><span class="v" id="sTime">–</span></div>
+    </div>
+    <div class="card">
+      <h2>Vorschau (Draufsicht, Extrusions-Pfade)</h2>
+      <canvas id="preview" width="800" height="600"></canvas>
+    </div>
+  </div>
+  <footer>Alles läuft lokal im Browser – die Datei verlässt deinen Rechner nicht.</footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  const drop = document.getElementById("drop");
+  const fileInput = document.getElementById("fileInput");
+
+  drop.addEventListener("click", () => fileInput.click());
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault(); drop.classList.remove("over");
+    if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener("change", () => { if (fileInput.files[0]) readFile(fileInput.files[0]); });
+
+  function readFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => analyze(file.name, reader.result);
+    reader.readAsText(file);
+  }
+
+  function analyze(name, text) {
+    const lines = text.split("\n");
+    let x = 0, y = 0, z = 0, e = 0, feed = 1500; // mm/min default
+    let absolute = true, eAbsolute = true;
+    const box = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity };
+    const zLayers = new Set();
+    let filament = 0, travel = 0, seconds = 0;
+    const paths = []; // Extrusionssegmente fuer die Vorschau
+
+    for (let i = 0; i < lines.length; i++) {
+      let line = lines[i];
+      const ci = line.indexOf(";");
+      if (ci !== -1) line = line.slice(0, ci);
+      line = line.trim();
+      if (!line) continue;
+
+      const parts = line.split(/\s+/);
+      const cmd = parts[0].toUpperCase();
+
+      if (cmd === "G90") { absolute = true; eAbsolute = true; continue; }
+      if (cmd === "G91") { absolute = false; eAbsolute = false; continue; }
+      if (cmd === "M82") { eAbsolute = true; continue; }
+      if (cmd === "M83") { eAbsolute = false; continue; }
+      if (cmd === "G92") {
+        for (let j = 1; j < parts.length; j++) {
+          const c = parts[j][0].toUpperCase(); const v = parseFloat(parts[j].slice(1));
+          if (isNaN(v)) continue;
+          if (c === "E") e = v; else if (c === "X") x = v; else if (c === "Y") y = v; else if (c === "Z") z = v;
+        }
+        continue;
+      }
+      if (cmd !== "G0" && cmd !== "G1") continue;
+
+      let nx = x, ny = y, nz = z, ne = e, hasE = false;
+      for (let j = 1; j < parts.length; j++) {
+        const c = parts[j][0].toUpperCase(); const v = parseFloat(parts[j].slice(1));
+        if (isNaN(v)) continue;
+        if (c === "X") nx = absolute ? v : x + v;
+        else if (c === "Y") ny = absolute ? v : y + v;
+        else if (c === "Z") nz = absolute ? v : z + v;
+        else if (c === "E") { ne = eAbsolute ? v : e + v; hasE = true; }
+        else if (c === "F") feed = v;
+      }
+
+      const dx = nx - x, dy = ny - y, dz = nz - z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const de = hasE ? ne - e : 0;
+      const extruding = de > 0 && dist > 0;
+
+      if (extruding) {
+        filament += de;
+        box.minX = Math.min(box.minX, x, nx); box.maxX = Math.max(box.maxX, x, nx);
+        box.minY = Math.min(box.minY, y, ny); box.maxY = Math.max(box.maxY, y, ny);
+        box.minZ = Math.min(box.minZ, z, nz); box.maxZ = Math.max(box.maxZ, z, nz);
+        zLayers.add(Math.round(nz * 100) / 100);
+        paths.push([x, y, nx, ny]);
+      }
+      travel += dist;
+      if (dist > 0 && feed > 0) seconds += dist / (feed / 60);
+      x = nx; y = ny; z = nz; if (hasE) e = ne;
+    }
+
+    const fmt = (v) => (isFinite(v) ? v.toFixed(1) : "0.0");
+    document.getElementById("sFile").textContent = name.length > 24 ? name.slice(0, 21) + "…" : name;
+    document.getElementById("sLines").textContent = lines.length.toLocaleString("de-CH");
+    document.getElementById("sX").textContent = fmt(box.maxX - box.minX) + " mm";
+    document.getElementById("sY").textContent = fmt(box.maxY - box.minY) + " mm";
+    document.getElementById("sZ").textContent = fmt(box.maxZ - box.minZ) + " mm";
+    document.getElementById("sLayers").textContent = zLayers.size.toLocaleString("de-CH");
+    document.getElementById("sFil").textContent = (filament / 1000).toFixed(2) + " m";
+    document.getElementById("sDist").textContent = (travel / 1000).toFixed(1) + " m";
+    const h = Math.floor(seconds / 3600), m = Math.round((seconds % 3600) / 60);
+    document.getElementById("sTime").textContent = h + " h " + m + " min";
+    document.getElementById("results").classList.remove("hidden");
+
+    draw(paths, box);
+  }
+
+  function draw(paths, box) {
+    const canvas = document.getElementById("preview");
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!paths.length || !isFinite(box.minX)) return;
+
+    const w = box.maxX - box.minX || 1, hgt = box.maxY - box.minY || 1;
+    const pad = 30;
+    const scale = Math.min((canvas.width - pad * 2) / w, (canvas.height - pad * 2) / hgt);
+    const ox = (canvas.width - w * scale) / 2, oy = (canvas.height - hgt * scale) / 2;
+    const tx = (v) => ox + (v - box.minX) * scale;
+    const ty = (v) => canvas.height - (oy + (v - box.minY) * scale); // Y nach oben
+
+    ctx.strokeStyle = "rgba(77, 208, 225, 0.35)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    // Bei riesigen Dateien ausduennen, damit das Rendering fluessig bleibt
+    const step = Math.max(1, Math.floor(paths.length / 60000));
+    for (let i = 0; i < paths.length; i += step) {
+      const p = paths[i];
+      ctx.moveTo(tx(p[0]), ty(p[1]));
+      ctx.lineTo(tx(p[2]), ty(p[3]));
+    }
+    ctx.stroke();
+  }
+})();
+</script>
+</body>
+</html>
