@@ -1,5 +1,7 @@
 # Gcode-Analyzer
 
+**Live-Demo:** https://grown661.github.io/gcode-analyzer/
+
 Gcode-Dateien vor dem Druck prüfen, ohne den Slicer zu öffnen: Abmessungen, Layer-Anzahl, Filament-Verbrauch und Druckzeit-Schätzung – direkt im Browser.
 
 ## Features
